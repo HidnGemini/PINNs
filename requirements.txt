@@ -1,0 +1,6 @@
+# First pip install -r pytorch_pip_requirements.txt, then pip install -r requirements.txt
+jupyter
+matplotlib
+numba
+pint
+f90nml
