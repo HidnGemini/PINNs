@@ -3,4 +3,5 @@ jupyter
 matplotlib
 numba
 pint
+scipy
 f90nml
