@@ -1,0 +1,249 @@
+import f90nml
+import numpy as np
+from pint import UnitRegistry; AssignQuantity = UnitRegistry().Quantity
+from QLCstuff2 import getNQLL
+import reference_solution as refsol
+from scipy.fft import rfft
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import icepinn as ip
+
+torch.set_default_dtype(torch.float64)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(device)
+
+#region Data preparation/pre-processing
+
+# Read in GI parameters
+inputfile = "GI parameters - Reference limit cycle (for testing).nml"
+GI=f90nml.read(inputfile)['GI']
+nx_crystal = GI['nx_crystal']
+L = GI['L']
+NBAR = GI['Nbar']
+NSTAR = GI['Nstar']
+
+# Define t range
+RUNTIME = 5
+NUM_T_STEPS = RUNTIME + 1
+
+# Define initial conditions
+Ntot_init_1D = np.ones(nx_crystal)
+Nqll_init_1D = getNQLL(Ntot_init_1D,NSTAR,NBAR)
+
+# Define x, t pairs for training
+X_QLC = np.linspace(-L,L,nx_crystal)
+t_points = np.linspace(0, RUNTIME, NUM_T_STEPS)
+x, t = np.meshgrid(X_QLC, t_points)
+training_set = torch.tensor(np.column_stack((x.flatten(), t.flatten()))).to(device)
+
+#endregion
+
+# Difference between nn._ and nn.functional._ is that functional is stateless: 
+# https://stackoverflow.com/questions/63826328/torch-nn-functional-vs-torch-nn-pytorch
+class IcePINN(nn.Module):
+    def __init__(self, num_hidden_layers, hidden_layer_size):
+        super().__init__()
+        self.fc_in = nn.Linear(2, hidden_layer_size)
+
+        self.fc_hidden = nn.ModuleList()
+        for _ in range(num_hidden_layers-1):
+            self.fc_hidden.append(nn.Linear(hidden_layer_size, hidden_layer_size))
+            
+        self.fc_out = nn.Linear(hidden_layer_size, 2)
+
+    def forward(self, x):
+        x = F.tanh(self.fc_in(x))
+        for layer in self.fc_hidden:
+            x = F.tanh(layer(x))
+        x = self.fc_out(x)
+        return x
+
+def get_device():
+    return device
+
+def compute_loss_gradients(xs, ys):
+    """
+    Computes gradients needed to compute collocation point loss. 
+    Expects batched input with requires_grad=TRUE.
+    Args:
+        xs: xs[0] = x, xs[1] = t
+        ys: ys[0] = Ntot, ys[1] = Nqll
+
+    Returns:
+        (dNtot_dt, dNqll_dt, dNqll_dxx)
+    """
+    # batch_size = len(xs)
+    xs.requires_grad_(True)  # Enable gradients for input (shape: (batch_size, 2))
+    
+    # ---- Compute First-Order Derivatives ----
+    # We'll compute the following:
+    #   Ntot_t = ∂Ntot/∂t, and
+    #   Nqll_t = ∂Nqll/∂t
+    #
+    # Here, the input is [x, t] so t is at index 1.
+
+    # Create grad_outputs tensor matching shape of model output
+    grad_outputs = torch.zeros_like(ys).to(device)
+
+    # 1. Compute gradient of Ntot:
+    grad_outputs[:, 0] = 1.0  # We want gradients for the first output (Ntot)
+    
+    grad_Ntot = torch.autograd.grad(
+        outputs=ys,
+        inputs=xs,
+        grad_outputs=grad_outputs,
+        create_graph=True,      # I think graph is needed for backprop later
+        retain_graph=True,
+        materialize_grads=True      # default is false
+    )[0]
+    Ntot_t = grad_Ntot[:, 1]   # Extract partial w.r.t. t
+
+    # 2. Compute gradient of Nqll:
+    grad_outputs.zero_()      # Reset grad_outputs to zeros
+    grad_outputs[:, 1] = 1.0  # Now we want gradients for the second output (Nqll)
+    grad_Nqll = torch.autograd.grad(
+        outputs=ys,
+        inputs=xs,
+        grad_outputs=grad_outputs,
+        create_graph=True,      # Needed to compute the second-order derivative
+        retain_graph=True,      # Retain graph for subsequent derivative computations
+        materialize_grads=True 
+    )[0]
+    Nqll_t = grad_Nqll[:, 1]   # Extract partial w.r.t. t
+
+    # ---- Compute Second-Order Derivative ----
+    # Now, compute the second derivative of Nqll with respect to x.
+    # Note that from grad_Nqll we already have ∂Nqll/∂x:
+    Nqll_x = grad_Nqll[:, 0]
+
+    # Compute the second derivative: d²Nqll/dx²
+    # We take the gradient of Nqll_x with respect to the initial inputs.
+    grad_Nqll_x = torch.autograd.grad(
+        outputs=Nqll_x,
+        inputs=xs,
+        grad_outputs=torch.ones_like(Nqll_x),
+        create_graph=True,      # I think graph is needed for backprop later
+        retain_graph=True,
+        materialize_grads=True 
+    )[0]
+    Nqll_xx = grad_Nqll_x[:, 0]  # Extract ∂²Nqll/∂x² (derivative with respect to x)
+
+    # Return relevant gradients
+    return Ntot_t.detach(), Nqll_t.detach(), Nqll_xx.detach()
+    # TODO - verify why detach() is important here
+
+def get_misc_params():
+    # TODO - make sigma I calculation work for user-specified collocation points, ie. for random resampling
+    # Supersaturation reduction at center
+    c_r = GI['c_r']
+
+    # Thickness of monolayers
+    h_pr = GI['h_pr']
+    h_pr_units = GI['h_pr_units']
+    h_pr = AssignQuantity(h_pr,h_pr_units)
+    h_pr.ito('micrometer')
+
+    # Deposition velocity
+    nu_kin = GI['nu_kin']
+    nu_kin_units = GI['nu_kin_units']
+    nu_kin = AssignQuantity(nu_kin,nu_kin_units)
+
+    # Difference in equilibrium supersaturation between microsurfaces I and II
+    sigma0 = torch.tensor(GI['sigma0']).to(device)
+
+    # Supersaturation at facet corner
+    sigmaI_corner = GI['sigmaI_corner']
+
+    # Time constant for freezing/thawing
+    tau_eq = GI['tau_eq']
+    tau_eq_units = GI['tau_eq_units']
+    tau_eq = AssignQuantity(tau_eq,tau_eq_units)
+
+    # Compute omega_kin
+    nu_kin_mlyperus = nu_kin/h_pr
+    nu_kin_mlyperus.ito('1/microsecond')
+    omega_kin = torch.tensor(nu_kin_mlyperus.magnitude * tau_eq.magnitude).to(device)
+
+    # Compute sigmaI
+    sigmaI = torch.tensor(sigmaI_corner*(c_r*(X_QLC/L)**2+1-c_r))
+    # Concatenate a copy of sigmaI for each timestep to prevent shape inconsistencies later
+    sigmaI = torch.cat([sigmaI]*NUM_T_STEPS).to(device)
+    
+    # sigma0, sigmaI, omega_kin = params
+    return sigma0, sigmaI, omega_kin
+
+def f1d_solve_ivp_dimensionless(Ntot, Nqll, dNqll_dxx, scalar_params):
+    """
+    Adapted from QLCstuff2, this function computes the right-hand side of
+    the two objective functions that make up the QLC system.
+    
+    Returns:
+        [dNtot_dt, dNqll_dt]
+    """
+    sigma0, sigmaI, omega_kin = scalar_params
+
+    # Ntot deposition
+    m = (Nqll - (NBAR - NSTAR))/(2*NSTAR)
+    sigma_m = (sigmaI - m * sigma0)
+    dNtot_dt = omega_kin * sigma_m
+    dNtot_dt += dNqll_dxx 
+    # NQLL    
+    dNqll_dt = dNtot_dt - (Nqll - (NBAR - NSTAR*torch.sin(2*np.pi*Ntot)))
+    
+    # Package for output
+    return dNtot_dt, dNqll_dt
+
+def calc_cp_loss(model, xs, params, epochs, epoch, print_every, print_gradients):
+    """Calculates collocation point loss.
+
+    Args:
+        xs: xs[0] = x, xs[1] = t
+        params: output of get_misc_params()
+
+    Returns:
+        (Ntot-loss, Nqll-loss)
+    """
+    # model predicts output of training_set as batch
+    ys = model(xs)
+    
+    # Calculate and extract gradients
+    dNtot_dt, dNqll_dt, dNqll_dxx = ip.compute_loss_gradients(xs, ys)
+    if (((epoch+1) % print_every) == 0) and print_gradients:
+        print(f"Gradients: {dNtot_dt}, {dNqll_dt}, {dNqll_dxx}.")
+
+    # Compute expected output
+    Ntot, Nqll = ys[:, 0], ys[:, 1]
+    dNtot_dt_rhs, dNqll_dt_rhs = ip.f1d_solve_ivp_dimensionless(Ntot, Nqll, dNqll_dxx, params)
+    
+    # dNtot_dt = Nqll*surface_diff_coefficient + w_kin*sigma_m
+    # dNqll_dt = dNtot/dt - (Nqll - Nqll_eq)
+    cat_test = torch.stack((dNtot_dt - dNtot_dt_rhs, dNqll_dt - dNqll_dt_rhs), axis=0)
+    
+    # Return loss as tensor of shape (2, len(xs))
+    # [dNtot_dt - dNtot_dt_rhs, dNqll_dt - dNqll_dt_rhs]
+    return torch.square(cat_test)
+
+def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, print_every, print_gradients=False):
+
+    print(f"Commencing PINN training for {epochs} epochs.")
+    # Retrieve miscellaneous params for loss calculation
+    params = ip.get_misc_params()
+
+    for epoch in range(epochs):
+        # evaluate collocation point loss
+        loss = ip.calc_cp_loss(model, training_set, params, epochs, epoch, print_every, print_gradients)
+
+        if ((epoch+1) % print_every) == 0:
+            print(f"Loss at epoch [{epoch+1}/{epochs}]: Ntot = {torch.sum(loss[0]).item()}, Nqll = {torch.sum(loss[1]).item()}.")
+            
+        # backward and optimize
+        loss.backward(torch.ones_like(loss)) # Computes loss gradients
+        optimizer.step() # Adjusts weights accordingly
+        optimizer.zero_grad() # Zeroes gradients so they don't affect future computations
+
+
+
+
+
