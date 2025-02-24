@@ -2,6 +2,7 @@ import f90nml
 import numpy as np
 from pint import UnitRegistry; AssignQuantity = UnitRegistry().Quantity
 from QLCstuff2 import getNQLL
+import os
 import reference_solution as refsol
 from scipy.fft import rfft
 import torch
@@ -225,11 +226,19 @@ def calc_cp_loss(model, xs, params, epochs, epoch, print_every, print_gradients)
     # [dNtot_dt - dNtot_dt_rhs, dNqll_dt - dNqll_dt_rhs]
     return torch.square(cat_test)
 
-def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, print_every, print_gradients=False):
+def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, save_path, print_every, print_gradients=False):
+
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
 
     print(f"Commencing PINN training for {epochs} epochs.")
     # Retrieve miscellaneous params for loss calculation
     params = ip.get_misc_params()
+    min_Ntot_loss = 10e12
+    min_Nqll_loss = 10e12
+    best_model_epoch = -1
+    best_model_Ntot_loss = 10e12
+    best_model_Nqll_loss = 10e12
 
     for epoch in range(epochs):
         # evaluate collocation point loss
@@ -237,11 +246,20 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, print_every, 
 
         if ((epoch+1) % print_every) == 0:
             print(f"Loss at epoch [{epoch+1}/{epochs}]: Ntot = {torch.sum(loss[0]).item()}, Nqll = {torch.sum(loss[1]).item()}.")
+        
+        if torch.sum(loss[0]) < min_Ntot_loss or torch.sum(loss[1]) < min_Nqll_loss:
+            torch.save(model.state_dict(), save_path+'/params.pth')
+            best_model_epoch = epoch
             
         # backward and optimize
         loss.backward(torch.ones_like(loss)) # Computes loss gradients
         optimizer.step() # Adjusts weights accordingly
         optimizer.zero_grad() # Zeroes gradients so they don't affect future computations
+
+    print(f'Training complete! Model from epoch {best_model_epoch+1} has been saved.')
+    print(f'Saved model Ntot loss: {best_model_Ntot_loss}.')
+    print(f'Saved model Nqll loss: {best_model_Nqll_loss}.')
+
 
 
 
