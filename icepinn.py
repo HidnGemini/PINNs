@@ -41,11 +41,20 @@ training_set = torch.tensor(np.column_stack((x.flatten(), t.flatten()))).to(devi
 
 #endregion
 
+class SinActivation(nn.Module):
+    def __init__(self):
+        super(SinActivation, self).__init__()
+    def forward(self, x):
+        return torch.sin(x)
+
 # Difference between nn._ and nn.functional._ is that functional is stateless: 
 # https://stackoverflow.com/questions/63826328/torch-nn-functional-vs-torch-nn-pytorch
 class IcePINN(nn.Module):
-    def __init__(self, num_hidden_layers, hidden_layer_size):
+    def __init__(self, num_hidden_layers, hidden_layer_size, is_sf_PINN=False):
         super().__init__()
+        self.is_sf = is_sf_PINN
+        self.sin = SinActivation()
+        
         self.fc_in = nn.Linear(2, hidden_layer_size)
 
         self.fc_hidden = nn.ModuleList()
@@ -55,7 +64,13 @@ class IcePINN(nn.Module):
         self.fc_out = nn.Linear(hidden_layer_size, 2)
 
     def forward(self, x):
-        x = F.tanh(self.fc_in(x))
+        if self.is_sf:
+            # Sinusoidal mapping of inputs: Increases initial gradient variability.
+            # This makes it less likely for the PINN to get stuck in local minima at the start of training.
+            x = self.sin(self.fc_in(2*np.pi*x))
+        else:
+            x = F.tanh(self.fc_in(x))
+
         for layer in self.fc_hidden:
             x = F.tanh(layer(x))
         x = self.fc_out(x)
@@ -243,22 +258,30 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, save_path, pr
     for epoch in range(epochs):
         # evaluate collocation point loss
         loss = ip.calc_cp_loss(model, training_set, params, epochs, epoch, print_every, print_gradients)
+        Ntot_loss = torch.sum(loss[0]).item()
+        Nqll_loss = torch.sum(loss[1]).item()
+
 
         if ((epoch+1) % print_every) == 0:
-            print(f"Loss at epoch [{epoch+1}/{epochs}]: Ntot = {torch.sum(loss[0]).item()}, Nqll = {torch.sum(loss[1]).item()}.")
-        
-        if torch.sum(loss[0]) < min_Ntot_loss or torch.sum(loss[1]) < min_Nqll_loss:
-            torch.save(model.state_dict(), save_path+'/params.pth')
-            best_model_epoch = epoch
+            print(f"Loss at epoch [{epoch+1}/{epochs}]: Ntot = {Ntot_loss:.3f}, Nqll = {Nqll_loss:.3f}.")
             
         # backward and optimize
         loss.backward(torch.ones_like(loss)) # Computes loss gradients
         optimizer.step() # Adjusts weights accordingly
         optimizer.zero_grad() # Zeroes gradients so they don't affect future computations
 
+        # This heuristic for best model isn't perfect, but it's a good start
+        if Ntot_loss < min_Ntot_loss or Nqll_loss < min_Nqll_loss:
+            torch.save(model.state_dict(), save_path+'/params.pth')
+            best_model_epoch = epoch
+            min_Ntot_loss = Ntot_loss
+            min_Nqll_loss = Nqll_loss
+            best_model_Ntot_loss = Ntot_loss
+            best_model_Nqll_loss = Nqll_loss
+
     print(f'Training complete! Model from epoch {best_model_epoch+1} has been saved.')
-    print(f'Saved model Ntot loss: {best_model_Ntot_loss}.')
-    print(f'Saved model Nqll loss: {best_model_Nqll_loss}.')
+    print(f'Saved model Ntot loss: {best_model_Ntot_loss:.3f}.')
+    print(f'Saved model Nqll loss: {best_model_Nqll_loss:.3f}.')
 
 
 
