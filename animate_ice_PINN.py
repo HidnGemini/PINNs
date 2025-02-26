@@ -11,8 +11,6 @@ torch.set_default_dtype(torch.float64)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(device)
 
-# TODO - revamp for PyTorch instead of Keras
-
 # Read in GI parameters
 inputfile = "GI parameters - Reference limit cycle (for testing).nml"
 GI=f90nml.read(inputfile)['GI']
@@ -58,12 +56,13 @@ def load_IcePINN(model_name):
     return loaded_model
 
 
-def animate_refsol(index):
+def animate_refsol(index, frame_interval = 50):
     """
     Animates reference solution.
 
     Args:
         index: 0 for Ntot, 1 for Nqll, 2 for N-ice
+        frame_interval: time in ms that each frame should remain on screen
     """
     REFERENCE_SOLUTION = refsol.generate_reference_solution(runtime=RUNTIME, num_steps=NUM_T_STEPS)
 
@@ -92,23 +91,24 @@ def animate_refsol(index):
         return (line)
 
     # animation!
-    animation = ani.FuncAnimation(fig=fig, func=update, frames=frames, interval=50)
+    animation = ani.FuncAnimation(fig=fig, func=update, frames=frames, interval=frame_interval)
     # show me the money
     plt.show()
 
-def animate_IcePINN(model_name, index):
+def animate_IcePINN(model_name, index, frame_interval = 50):
     """
     Animates PINN model output.
 
     Args:
         model_name: String name of folder model is stored in
         index: 0 for Ntot, 1 for Nqll, 2 for N-ice
+        frame_interval: time in ms that each frame should remain on screen
     """
     loaded_model = load_IcePINN(model_name)
     loaded_model.eval()
 
     # Get predictions from the network using test data
-    pred = loaded_model(TEST_SET)
+    pred = ip.enforced_model(TEST_SET, loaded_model)
     Ntot_pred = pred[:, 0]
     Nqll_pred = pred[:, 1]
     Nice_pred = Ntot_pred - Nqll_pred
@@ -145,24 +145,25 @@ def animate_IcePINN(model_name, index):
         return (line)
 
     # animation!
-    animation = ani.FuncAnimation(fig=fig, func=update, frames=frames, interval=50)
+    animation = ani.FuncAnimation(fig=fig, func=update, frames=frames, interval=frame_interval)
     # show me the money
     plt.show()
 
 
-def animate_both(model_name, index):
+def animate_both(model_name, index, frame_interval = 50):
     """
     Animates PINN model output superimposed on reference solution.
 
     Args:
         model_name: String name of folder model is stored in
         index: 0 for Ntot, 1 for Nqll, 2 for N-ice
+        frame_interval: time in ms that each frame should remain on screen
     """
     loaded_model = load_IcePINN(model_name)
     loaded_model.eval()
 
     # Get predictions from the network using test data
-    pred = loaded_model(TEST_SET)
+    pred = ip.enforced_model(TEST_SET, loaded_model)
     Ntot_pred = pred[:, 0]
     Nqll_pred = pred[:, 1]
     Nice_pred = Ntot_pred - Nqll_pred
@@ -204,7 +205,7 @@ def animate_both(model_name, index):
         return (lines)
 
     # animation!
-    animation = ani.FuncAnimation(fig=fig, func=update, frames=frames, interval=50)
+    animation = ani.FuncAnimation(fig=fig, func=update, frames=frames, interval=frame_interval)
     # show me the money
     plt.show()
     

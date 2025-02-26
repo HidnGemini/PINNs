@@ -1,7 +1,6 @@
 import f90nml
 import numpy as np
 from pint import UnitRegistry; AssignQuantity = UnitRegistry().Quantity
-from QLCstuff2 import getNQLL
 import os
 import reference_solution as refsol
 from scipy.fft import rfft
@@ -14,32 +13,6 @@ import icepinn as ip
 torch.set_default_dtype(torch.float64)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(device)
-
-#region Data preparation/pre-processing
-
-# Read in GI parameters
-inputfile = "GI parameters - Reference limit cycle (for testing).nml"
-GI=f90nml.read(inputfile)['GI']
-nx_crystal = GI['nx_crystal']
-L = GI['L']
-NBAR = GI['Nbar']
-NSTAR = GI['Nstar']
-
-# Define t range
-RUNTIME = 5
-NUM_T_STEPS = RUNTIME + 1
-
-# Define initial conditions
-Ntot_init_1D = np.ones(nx_crystal)
-Nqll_init_1D = getNQLL(Ntot_init_1D,NSTAR,NBAR)
-
-# Define x, t pairs for training
-X_QLC = np.linspace(-L,L,nx_crystal)
-t_points = np.linspace(0, RUNTIME, NUM_T_STEPS)
-x, t = np.meshgrid(X_QLC, t_points)
-training_set = torch.tensor(np.column_stack((x.flatten(), t.flatten()))).to(device)
-
-#endregion
 
 class SinActivation(nn.Module):
     def __init__(self):
@@ -75,6 +48,42 @@ class IcePINN(nn.Module):
             x = F.tanh(layer(x))
         x = self.fc_out(x)
         return x
+
+def enforced_model(coords, model: IcePINN):
+    """
+    Wrap IcePINN models in this function for training and evaluation to hard-enforce
+    the initial condition using reparameterization.
+
+    Args:
+      coords: Tensor of shape [batch_size, 2], where the first column is x and the second is t.
+      model: Neural network that takes the full coordinate tensor [x, t] and outputs a tensor of shape [batch_size, 2],
+             corresponding to [NN_tot, NN_qll].
+    
+    Returns:
+      Tensor of shape [batch_size, 2] where:
+        - Column 0 is Ntot, satisfying Ntot(x, 0) = 1.
+        - Column 1 is Nqll, satisfying Nqll(x, 0) = get_Nqll(Ntot(x, 0)).
+    """    
+    # Extract t from the coordinates tensor
+    t = coords[:, 1:2]
+    
+    # Get the raw outputs from the network
+    nn_out = model(coords)  # Expecting shape [batch_size, 2]
+    NN_tot = nn_out[:, 0:1]
+    NN_qll = nn_out[:, 1:2]
+    
+    # Reparameterize to enforce the initial conditions:
+    # For Ntot: initial condition is 1.
+    Ntot = 1.0 + t * NN_tot
+    
+    # For Nqll: initial condition is get_Nqll(1)
+    Nqll = get_Nqll(1.0) + t * NN_qll
+    
+    # Concatenate the outputs to form a tensor with the same shape as coords ([batch_size, 2])
+    return torch.cat([Ntot, Nqll], dim=1)
+
+def get_Nqll(Ntot):
+    return NBAR - NSTAR*np.sin(2*np.pi*Ntot)
 
 def get_device():
     return device
@@ -211,21 +220,21 @@ def f1d_solve_ivp_dimensionless(Ntot, Nqll, dNqll_dxx, scalar_params):
     # Package for output
     return dNtot_dt, dNqll_dt
 
-def calc_cp_loss(model, xs, params, epochs, epoch, print_every, print_gradients):
+def calc_cp_loss(model: IcePINN, coords, params, epochs, epoch, print_every, print_gradients):
     """Calculates collocation point loss.
 
     Args:
-        xs: xs[0] = x, xs[1] = t
+        coords: (x, t), or a tensor of size [2, batch_size] containing batch_size (x, t) coordinate pairs
         params: output of get_misc_params()
 
     Returns:
-        (Ntot-loss, Nqll-loss)
+        (Ntot-loss, Nqll-loss), or a tensor of input shape containing (Ntot-loss, Nqll-loss) pairs.
     """
     # model predicts output of training_set as batch
-    ys = model(xs)
+    ys = enforced_model(coords, model)
     
     # Calculate and extract gradients
-    dNtot_dt, dNqll_dt, dNqll_dxx = ip.compute_loss_gradients(xs, ys)
+    dNtot_dt, dNqll_dt, dNqll_dxx = ip.compute_loss_gradients(coords, ys)
     if (((epoch+1) % print_every) == 0) and print_gradients:
         print(f"Gradients: {dNtot_dt}, {dNqll_dt}, {dNqll_dxx}.")
 
@@ -235,9 +244,9 @@ def calc_cp_loss(model, xs, params, epochs, epoch, print_every, print_gradients)
     
     # dNtot_dt = Nqll*surface_diff_coefficient + w_kin*sigma_m
     # dNqll_dt = dNtot/dt - (Nqll - Nqll_eq)
-    cat_test = torch.stack((dNtot_dt - dNtot_dt_rhs, dNqll_dt - dNqll_dt_rhs), axis=0)
+    cat_test = torch.stack((dNtot_dt - dNtot_dt_rhs, dNqll_dt - dNqll_dt_rhs), axis=1)
     
-    # Return loss as tensor of shape (2, len(xs))
+    # Return squared loss as tensor of shape (len(coords), 2)
     # [dNtot_dt - dNtot_dt_rhs, dNqll_dt - dNqll_dt_rhs]
     return torch.square(cat_test)
 
@@ -251,16 +260,15 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, save_path, pr
     params = ip.get_misc_params()
     min_Ntot_loss = 10e12
     min_Nqll_loss = 10e12
-    best_model_epoch = -1
     best_model_Ntot_loss = 10e12
     best_model_Nqll_loss = 10e12
+    best_model_epoch = -1
 
     for epoch in range(epochs):
         # evaluate collocation point loss
         loss = ip.calc_cp_loss(model, training_set, params, epochs, epoch, print_every, print_gradients)
-        Ntot_loss = torch.sum(loss[0]).item()
-        Nqll_loss = torch.sum(loss[1]).item()
-
+        Ntot_loss = torch.sum(loss[:, 0]).item()
+        Nqll_loss = torch.sum(loss[:, 1]).item()
 
         if ((epoch+1) % print_every) == 0:
             print(f"Loss at epoch [{epoch+1}/{epochs}]: Ntot = {Ntot_loss:.3f}, Nqll = {Nqll_loss:.3f}.")
@@ -272,10 +280,13 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, save_path, pr
 
         # This heuristic for best model isn't perfect, but it's a good start
         if Ntot_loss < min_Ntot_loss or Nqll_loss < min_Nqll_loss:
+            # Save model (not including initial condition wrapper)
             torch.save(model.state_dict(), save_path+'/params.pth')
             best_model_epoch = epoch
-            min_Ntot_loss = Ntot_loss
-            min_Nqll_loss = Nqll_loss
+            if Ntot_loss < min_Ntot_loss:
+                min_Ntot_loss = Ntot_loss
+            else:
+                min_Nqll_loss = Nqll_loss
             best_model_Ntot_loss = Ntot_loss
             best_model_Nqll_loss = Nqll_loss
 
@@ -284,7 +295,31 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, save_path, pr
     print(f'Saved model Nqll loss: {best_model_Nqll_loss:.3f}.')
 
 
+#region Data preparation/pre-processing
 
+# Read in GI parameters
+inputfile = "GI parameters - Reference limit cycle (for testing).nml"
+GI=f90nml.read(inputfile)['GI']
+nx_crystal = GI['nx_crystal']
+L = GI['L']
+NBAR = GI['Nbar']
+NSTAR = GI['Nstar']
+
+# Define t range (needs to be same as training file)
+RUNTIME = 5
+NUM_T_STEPS = RUNTIME*5 + 1
+
+# Define initial conditions
+Ntot_init = np.ones(nx_crystal)
+Nqll_init = get_Nqll(Ntot_init)
+
+# Define x, t pairs for training
+X_QLC = np.linspace(-L,L,nx_crystal)
+t_points = np.linspace(0, RUNTIME, NUM_T_STEPS)
+x, t = np.meshgrid(X_QLC, t_points)
+training_set = torch.tensor(np.column_stack((x.flatten(), t.flatten()))).to(device)
+
+#endregion
 
 
 
