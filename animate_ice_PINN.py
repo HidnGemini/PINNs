@@ -30,32 +30,6 @@ TEST_SET = torch.tensor(np.column_stack((x.flatten(), t.flatten()))).to(device)
 
 TITLE_DICT = {0: "Ntot", 1: "Nqll", 2: "N-ice"}
 
-def load_IcePINN(model_name):
-    """
-    Loads a saved IcePINN.
-    Args:
-        model_name: String name of folder model is stored in
-    """
-    path = './models/'+model_name+'/params.pth'
-    state_dict = torch.load(path)
-    model_dimensions = state_dict['dimensions']
-    is_sf_PINN = state_dict['is_sf_PINN']
-
-    loaded_model = ip.IcePINN(
-        num_hidden_layers=model_dimensions[0], 
-        hidden_layer_size=model_dimensions[0], 
-        is_sf_PINN=is_sf_PINN.item())
-
-    # match buffers with the model being loaded
-    loaded_model.register_buffer('dimensions', model_dimensions)
-    loaded_model.register_buffer('is_sf_PINN', is_sf_PINN)
-
-    loaded_model.load_state_dict(state_dict, strict=False) # takes the loaded dictionary, not the path file itself
-    loaded_model.to(device)
-    
-    return loaded_model
-
-
 def animate_refsol(index, frame_interval = 50):
     """
     Animates reference solution.
@@ -104,7 +78,7 @@ def animate_IcePINN(model_name, index, frame_interval = 50):
         index: 0 for Ntot, 1 for Nqll, 2 for N-ice
         frame_interval: time in ms that each frame should remain on screen
     """
-    loaded_model = load_IcePINN(model_name)
+    loaded_model = ip.load_IcePINN(model_name)
     loaded_model.eval()
 
     # Get predictions from the network using test data
@@ -159,7 +133,7 @@ def animate_both(model_name, index, frame_interval = 50):
         index: 0 for Ntot, 1 for Nqll, 2 for N-ice
         frame_interval: time in ms that each frame should remain on screen
     """
-    loaded_model = load_IcePINN(model_name)
+    loaded_model = ip.load_IcePINN(model_name)
     loaded_model.eval()
 
     # Get predictions from the network using test data

@@ -85,6 +85,10 @@ def enforced_model(coords, model: IcePINN):
 def get_Nqll(Ntot):
     return NBAR - NSTAR*np.sin(2*np.pi*Ntot)
 
+def init_HE(m):
+	if type(m) == nn.Linear:
+		nn.init.kaiming_normal_(m.weight)
+
 def get_device():
     return device
 
@@ -250,12 +254,14 @@ def calc_cp_loss(model: IcePINN, coords, params, epochs, epoch, print_every, pri
     # [dNtot_dt - dNtot_dt_rhs, dNqll_dt - dNqll_dt_rhs]
     return torch.square(cat_test)
 
-def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, save_path, print_every, print_gradients=False):
+def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, name, print_every, print_gradients=False, LR_scheduler=None):
 
+    save_path = './models/'+name
     if not os.path.exists(save_path):
         os.makedirs(save_path)
 
-    print(f"Commencing PINN training for {epochs} epochs.")
+    print(f"Commencing PINN training on {len(training_set)} points for {epochs} epochs.")
+
     # Retrieve miscellaneous params for loss calculation
     params = ip.get_misc_params()
     min_Ntot_loss = 10e12
@@ -264,19 +270,37 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, save_path, pr
     best_model_Nqll_loss = 10e12
     best_model_epoch = -1
 
+    
+    # Two learning rate schedulers tracking different loss values
+    # If loss a scheduler is tracking doesn't improve for 'patience' epochs,
+    # LR is multiplied by factor
+    # scheduler_Ntot = optim.lr_scheduler.ReduceLROnPlateau(
+    #     optimizer, mode='min', factor=0.5, patience=1000
+    # )
+    # scheduler_Nqll = optim.lr_scheduler.ReduceLROnPlateau(
+    #     optimizer, mode='min', factor=0.5, patience=1000
+    # )
+    
+
     for epoch in range(epochs):
+        # Zero accumulated gradients so they don't affect future computations
+        optimizer.zero_grad() 
+
         # evaluate collocation point loss
         loss = ip.calc_cp_loss(model, training_set, params, epochs, epoch, print_every, print_gradients)
         Ntot_loss = torch.sum(loss[:, 0]).item()
         Nqll_loss = torch.sum(loss[:, 1]).item()
 
+        if LR_scheduler is not None:
+            scheduler.step(Ntot_loss+Nqll_loss)
+
         if ((epoch+1) % print_every) == 0:
-            print(f"Loss at epoch [{epoch+1}/{epochs}]: Ntot = {Ntot_loss:.3f}, Nqll = {Nqll_loss:.3f}.")
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch [{epoch+1}/{epochs}]: Ntot = {Ntot_loss:.3f}, Nqll = {Nqll_loss:.3f}, LR = {optimizer.param_groups[0]['lr']}")
             
         # backward and optimize
         loss.backward(torch.ones_like(loss)) # Computes loss gradients
         optimizer.step() # Adjusts weights accordingly
-        optimizer.zero_grad() # Zeroes gradients so they don't affect future computations
 
         # This heuristic for best model isn't perfect, but it's a good start
         if Ntot_loss < min_Ntot_loss or Nqll_loss < min_Nqll_loss:
@@ -290,9 +314,36 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, save_path, pr
             best_model_Ntot_loss = Ntot_loss
             best_model_Nqll_loss = Nqll_loss
 
-    print(f'Training complete! Model from epoch {best_model_epoch+1} has been saved.')
+    print(f'Training complete! Model {name} from epoch {best_model_epoch+1} has been saved.')
     print(f'Saved model Ntot loss: {best_model_Ntot_loss:.3f}.')
     print(f'Saved model Nqll loss: {best_model_Nqll_loss:.3f}.')
+
+def load_IcePINN(model_name):
+    """
+    Loads a saved IcePINN.
+    Args:
+        model_name: String name of folder model is stored in
+    """
+    path = './models/'+model_name+'/params.pth'
+    state_dict = torch.load(path)
+    model_dimensions = state_dict['dimensions']
+    is_sf_PINN = state_dict['is_sf_PINN']
+
+    loaded_model = ip.IcePINN(
+        num_hidden_layers=model_dimensions[0], 
+        hidden_layer_size=model_dimensions[0], 
+        is_sf_PINN=is_sf_PINN.item())
+
+    # match buffers with the model being loaded
+    loaded_model.register_buffer('dimensions', model_dimensions)
+    loaded_model.register_buffer('is_sf_PINN', is_sf_PINN)
+
+    loaded_model.load_state_dict(state_dict, strict=False) # takes the loaded dictionary, not the path file itself
+    loaded_model.to(device)
+    
+    return loaded_model
+
+
 
 
 #region Data preparation/pre-processing
@@ -307,6 +358,7 @@ NSTAR = GI['Nstar']
 
 # Define t range (needs to be same as training file)
 RUNTIME = 5
+#NUM_T_STEPS = RUNTIME + 1
 NUM_T_STEPS = RUNTIME*5 + 1
 
 # Define initial conditions
