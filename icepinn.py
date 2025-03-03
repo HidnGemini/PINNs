@@ -4,6 +4,7 @@ from pint import UnitRegistry; AssignQuantity = UnitRegistry().Quantity
 import os
 import reference_solution as refsol
 from scipy.fft import rfft
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,18 +21,37 @@ class SinActivation(nn.Module):
     def forward(self, x):
         return torch.sin(x)
 
+class SinusoidalMappingLayer(nn.Module):
+    def __init__(self, input_dim, num_features, sigma=1.0):
+        super(SinusoidalMappingLayer, self).__init__()
+        self.num_features = num_features
+        # Initialize W_1 with Normal(0, sigma^2)
+        self.W = nn.Parameter(torch.randn(num_features, input_dim) * sigma*sigma)
+        # Initialize b_1 (phase lag) to zeros
+        self.b = nn.Parameter(torch.zeros(num_features))
+    
+    def forward(self, x):
+        # Compute W*x + b, note that we need to transpose W for correct dimensions
+        x_proj = torch.matmul(x, self.W.t()) + self.b
+        # Apply the sinusoidal mapping: sin(2*pi*(W*x + b))
+        return torch.sin(2*np.pi*x_proj)
+
 # Difference between nn._ and nn.functional._ is that functional is stateless: 
 # https://stackoverflow.com/questions/63826328/torch-nn-functional-vs-torch-nn-pytorch
 class IcePINN(nn.Module):
     def __init__(self, num_hidden_layers, hidden_layer_size, is_sf_PINN=False):
         super().__init__()
         self.is_sf = is_sf_PINN
+        self.sml = SinusoidalMappingLayer(2, hidden_layer_size*3) # Consider fiddling with sigma
+        self.post_sml = nn.Linear(hidden_layer_size*3, hidden_layer_size)
+        
         self.sin = SinActivation()
         
         self.fc_in = nn.Linear(2, hidden_layer_size)
+        self.post_fc_in = nn.Linear(hidden_layer_size, hidden_layer_size)
 
         self.fc_hidden = nn.ModuleList()
-        for _ in range(num_hidden_layers-1):
+        for _ in range(num_hidden_layers-2):
             self.fc_hidden.append(nn.Linear(hidden_layer_size, hidden_layer_size))
             
         self.fc_out = nn.Linear(hidden_layer_size, 2)
@@ -40,12 +60,15 @@ class IcePINN(nn.Module):
         if self.is_sf:
             # Sinusoidal mapping of inputs: Increases initial gradient variability.
             # This makes it less likely for the PINN to get stuck in local minima at the start of training.
-            x = self.sin(self.fc_in(2*np.pi*x))
+            x = self.sml(x) 
+            x = F.tanh(self.post_sml(x))
         else:
             x = F.tanh(self.fc_in(x))
+            x = F.tanh(self.post_fc_in(x))
 
         for layer in self.fc_hidden:
             x = F.tanh(layer(x))
+
         x = self.fc_out(x)
         return x
 
@@ -86,8 +109,9 @@ def get_Nqll(Ntot):
     return NBAR - NSTAR*np.sin(2*np.pi*Ntot)
 
 def init_HE(m):
-	if type(m) == nn.Linear:
-		nn.init.kaiming_normal_(m.weight)
+    # We don't want to interfere with custom initialization of SinusoidalMappingLayer
+    if type(m) == nn.Linear:
+	    nn.init.kaiming_normal_(m.weight)
 
 def get_device():
     return device
@@ -270,17 +294,7 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, name, print_e
     best_model_Nqll_loss = 10e12
     best_model_epoch = -1
 
-    
-    # Two learning rate schedulers tracking different loss values
-    # If loss a scheduler is tracking doesn't improve for 'patience' epochs,
-    # LR is multiplied by factor
-    # scheduler_Ntot = optim.lr_scheduler.ReduceLROnPlateau(
-    #     optimizer, mode='min', factor=0.5, patience=1000
-    # )
-    # scheduler_Nqll = optim.lr_scheduler.ReduceLROnPlateau(
-    #     optimizer, mode='min', factor=0.5, patience=1000
-    # )
-    
+    start_time = time.time()    
 
     for epoch in range(epochs):
         # Zero accumulated gradients so they don't affect future computations
@@ -292,11 +306,21 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, name, print_e
         Nqll_loss = torch.sum(loss[:, 1]).item()
 
         if LR_scheduler is not None:
-            scheduler.step(Ntot_loss+Nqll_loss)
+            LR_scheduler.step(Ntot_loss+Nqll_loss)
 
         if ((epoch+1) % print_every) == 0:
             current_lr = optimizer.param_groups[0]['lr']
-            print(f"Epoch [{epoch+1}/{epochs}]: Ntot = {Ntot_loss:.3f}, Nqll = {Nqll_loss:.3f}, LR = {optimizer.param_groups[0]['lr']}")
+            
+            elapsed = time.time() - start_time
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+            
+            this_epoch = epoch+1
+            if (print_every % 1000) == 0:
+                this_epoch = this_epoch // 1000
+            else:
+                this_epoch = this_epoch / 1000
+            print(f"Epoch [{this_epoch}k/{epochs//1000}k] at {minutes}m {seconds}s: Ntot = {Ntot_loss:.3f}, Nqll = {Nqll_loss:.3f}, LR = {optimizer.param_groups[0]['lr']}")
             
         # backward and optimize
         loss.backward(torch.ones_like(loss)) # Computes loss gradients
@@ -314,7 +338,11 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, name, print_e
             best_model_Ntot_loss = Ntot_loss
             best_model_Nqll_loss = Nqll_loss
 
-    print(f'Training complete! Model {name} from epoch {best_model_epoch+1} has been saved.')
+    elapsed = time.time() - start_time
+    minutes = int(elapsed // 60)
+    seconds = int(elapsed % 60)
+    print(f'Training complete after {minutes} minutes and {seconds} seconds')
+    print(f'Model {name} from epoch {best_model_epoch+1} has been saved.')
     print(f'Saved model Ntot loss: {best_model_Ntot_loss:.3f}.')
     print(f'Saved model Nqll loss: {best_model_Nqll_loss:.3f}.')
 
@@ -331,7 +359,7 @@ def load_IcePINN(model_name):
 
     loaded_model = ip.IcePINN(
         num_hidden_layers=model_dimensions[0], 
-        hidden_layer_size=model_dimensions[0], 
+        hidden_layer_size=model_dimensions[1], 
         is_sf_PINN=is_sf_PINN.item())
 
     # match buffers with the model being loaded
@@ -358,8 +386,8 @@ NSTAR = GI['Nstar']
 
 # Define t range (needs to be same as training file)
 RUNTIME = 5
-#NUM_T_STEPS = RUNTIME + 1
-NUM_T_STEPS = RUNTIME*5 + 1
+NUM_T_STEPS = RUNTIME + 1
+#NUM_T_STEPS = RUNTIME*5 + 1
 
 # Define initial conditions
 Ntot_init = np.ones(nx_crystal)
