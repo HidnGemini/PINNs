@@ -30,7 +30,7 @@ TEST_SET = torch.tensor(np.column_stack((x.flatten(), t.flatten()))).to(device)
 
 TITLE_DICT = {0: "Ntot", 1: "Nqll", 2: "N-ice"}
 
-def animate_refsol(index, frame_interval = 50):
+def animate_refsol(index, frame_interval = 50, with_diffusion=True):
     """
     Animates reference solution.
 
@@ -38,7 +38,7 @@ def animate_refsol(index, frame_interval = 50):
         index: 0 for Ntot, 1 for Nqll, 2 for N-ice
         frame_interval: time in ms that each frame should remain on screen
     """
-    REFERENCE_SOLUTION = refsol.generate_reference_solution(runtime=RUNTIME, num_steps=NUM_T_STEPS)
+    REFERENCE_SOLUTION = refsol.generate_reference_solution(runtime=RUNTIME, num_steps=NUM_T_STEPS, with_diffusion=with_diffusion)
 
     # set up graph
     fig, ax = plt.subplots()
@@ -140,10 +140,13 @@ def animate_together(model1_name, model2_name, index, frame_interval = 50):
     model1_solution = "foo"
     model2_solution = "bar"
     
-    if model1_name is None:
+    if model1_name is True or model1_name is False:
         # Generate reference solution
-        model1_solution = refsol.generate_reference_solution(runtime=RUNTIME, num_steps=NUM_T_STEPS)
-        model1_name = "Reference Solution"
+        model1_solution = refsol.generate_reference_solution(runtime=RUNTIME, num_steps=NUM_T_STEPS, with_diffusion=model1_name)
+        if model1_name is False:
+            model1_name = "Reference Solution (without diffusion)"
+        else:
+            model1_name = "Reference Solution (with diffusion)"
     else:
         model1 = ip.load_IcePINN(model1_name)
         model1.eval()
@@ -160,10 +163,13 @@ def animate_together(model1_name, model2_name, index, frame_interval = 50):
             axis=0).reshape(3, NUM_T_STEPS, int(len(TEST_SET)/NUM_T_STEPS)
                 ).cpu().detach().numpy() # Animation breaks on GPU; move to CPU
     
-    if model2_name is None:
+    if model2_name is True or model2_name is False:
         # Generate reference solution
-        model2_solution = refsol.generate_reference_solution(runtime=RUNTIME, num_steps=NUM_T_STEPS)
-        model2_name = "Reference Solution"
+        model2_solution = refsol.generate_reference_solution(runtime=RUNTIME, num_steps=NUM_T_STEPS, with_diffusion=model2_name)
+        if model2_name is False:
+            model2_name = "Reference Solution (without diffusion)"
+        else:
+            model2_name = "Reference Solution (with diffusion)"
     else:
         model2 = ip.load_IcePINN(model2_name)
         model2.eval()

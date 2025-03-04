@@ -28,24 +28,23 @@ def getDeltaNQLL(Ntot,Nstar,Nbar,NQLL):
     return NQLL - (Nbar - Nstar*np.sin(2*np.pi*Ntot))
 
 def f1d_solve_ivp_dimensionless(t, y, scalar_params, sigmaI, j2_list):
-    Nbar, Nstar, sigma0, omega_kin, deltax, D, t_0 = scalar_params
+    Nbar, Nstar, sigma0, omega_kin, deltax, D, t_0, with_diffusion = scalar_params
     l = int(len(y)/2)
     NQLL0 = y[:l]
     Ntot0 = y[l:]
-
-    # Diffusion term based on FT
-    Dcoefficient1 =   4 * np.pi**2 / (deltax * l)**2  #print('Dcoefficient1', Dcoefficient1)
-    bj_list = rfft(NQLL0)
-    cj_list = bj_list*j2_list
-    dy = -Dcoefficient1  * irfft(cj_list)
 
     # Ntot deposition
     m = (NQLL0 - (Nbar - Nstar))/(2*Nstar)
     sigma_m = (sigmaI - m * sigma0)
     dNtot_dt = omega_kin * sigma_m
 
-    # Combined
-    dNtot_dt += dy
+    if with_diffusion:
+        # Diffusion term based on FT
+        Dcoefficient1 =   4 * np.pi**2 / (deltax * l)**2  #print('Dcoefficient1', Dcoefficient1)
+        bj_list = rfft(NQLL0)
+        cj_list = bj_list*j2_list
+        dy = -Dcoefficient1  * irfft(cj_list)
+        dNtot_dt += dy
 
     # NQLL    
     dNQLL_dt = dNtot_dt - (NQLL0 - (Nbar - Nstar*np.sin(2*np.pi*Ntot0)))
@@ -58,7 +57,7 @@ def run_f1d_dimensionless(\
            NQLL_init_1D,Ntot_init_1D,times,\
            Nbar, Nstar, sigma0, nu_kin_mlyperus, deltaX, D, tau_eq, sigmaI,\
            AssignQuantity,\
-           verbose=0, odemethod='LSODA'):
+           verbose=0, odemethod='LSODA', with_diffusion=True):
     """
     Takes dimensional arrays for NQLL, Ntot, and time steps but not dimensional quantities for scalars
     """
@@ -85,7 +84,7 @@ def run_f1d_dimensionless(\
 
     # Bundle params for ODE solver
     scalar_params = np.array(\
-        [Nbar, Nstar, sigma0, omega_kin, deltaX_nondim, D, tau_eq])
+        [Nbar, Nstar, sigma0, omega_kin, deltaX_nondim, D, tau_eq, with_diffusion])
     
     # Loop over times
     for i in range(0,nt-1):
@@ -144,7 +143,7 @@ def run_f1d_dimensionless(\
     Ntotkeep_1D = ykeep_1Darr_reshaped[:,1,:]
     NQLLkeep_1D = ykeep_1Darr_reshaped[:,0,:]
     
-    #scale back to dimensionalized space
+    # This would be how we would scale back to dimensionalized space
     Ntotkeep_1D = Ntotkeep_1D #* np.sqrt(D * tau_eq)
     NQLLkeep_1D = NQLLkeep_1D #* np.sqrt(D * tau_eq)
     

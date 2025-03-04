@@ -25,7 +25,7 @@ tau_eq = GI['tau_eq']
 X_QLC = np.linspace(-L,L,nx_crystal)
 
 
-def generate_reference_solution(runtime = 50, num_steps = 51, verbose = False):
+def generate_reference_solution(runtime = 50, num_steps = 51, verbose = False, with_diffusion=True):
     """ 
     Generates a reference solution for the QLC problem using a non-dimensional model.
 
@@ -153,7 +153,7 @@ def generate_reference_solution(runtime = 50, num_steps = 51, verbose = False):
         tau_eq.magnitude, 
         sigmaI_QLC,\
         AssignQuantity,\
-        verbose=0, odemethod='RK45')
+        verbose=0, odemethod='RK45', with_diffusion=with_diffusion)
     
     
     Nicekeep_1D_nondimensional = Ntotkeep_1D_nondimensional-NQLLkeep_1D_nondimensional
