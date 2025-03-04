@@ -116,7 +116,7 @@ def init_HE(m):
 def get_device():
     return device
 
-def compute_loss_gradients(xs, ys):
+def compute_loss_gradients(xs, ys, diffusion):
     """
     Computes gradients needed to compute collocation point loss. 
     Expects batched input with requires_grad=TRUE.
@@ -151,7 +151,7 @@ def compute_loss_gradients(xs, ys):
         retain_graph=True,
         materialize_grads=True      # default is false
     )[0]
-    Ntot_t = grad_Ntot[:, 1]   # Extract partial w.r.t. t
+    dNtot_t = grad_Ntot[:, 1]   # Extract ∂Ntot/∂t
 
     # 2. Compute gradient of Nqll:
     grad_outputs.zero_()      # Reset grad_outputs to zeros
@@ -164,27 +164,30 @@ def compute_loss_gradients(xs, ys):
         retain_graph=True,      # Retain graph for subsequent derivative computations
         materialize_grads=True 
     )[0]
-    Nqll_t = grad_Nqll[:, 1]   # Extract partial w.r.t. t
+    dNqll_t = grad_Nqll[:, 1]   # Extract ∂Nqll/∂t
 
-    # ---- Compute Second-Order Derivative ----
-    # Now, compute the second derivative of Nqll with respect to x.
-    # Note that from grad_Nqll we already have ∂Nqll/∂x:
-    Nqll_x = grad_Nqll[:, 0]
+    if diffusion:
+        # ---- Compute Second-Order Derivative ----
+        # Note that from grad_Nqll we already have ∂Nqll/∂x:
+        dNqll_x = grad_Nqll[:, 0]
 
-    # Compute the second derivative: d²Nqll/dx²
-    # We take the gradient of Nqll_x with respect to the initial inputs.
-    grad_Nqll_x = torch.autograd.grad(
-        outputs=Nqll_x,
-        inputs=xs,
-        grad_outputs=torch.ones_like(Nqll_x),
-        create_graph=True,      # I think graph is needed for backprop later
-        retain_graph=True,
-        materialize_grads=True 
-    )[0]
-    Nqll_xx = grad_Nqll_x[:, 0]  # Extract ∂²Nqll/∂x² (derivative with respect to x)
+        # We take the gradient of Nqll_x with respect to the initial inputs.
+        grad_Nqll_x = torch.autograd.grad(
+            outputs=dNqll_x,
+            inputs=xs,
+            grad_outputs=torch.ones_like(dNqll_x),
+            create_graph=True,      # I think graph is needed for backprop later
+            retain_graph=True,
+            materialize_grads=True 
+        )[0]
+        dNqll_xx = grad_Nqll_x[:, 0]  # Extract ∂²Nqll/∂x² (derivative with respect to x)
+        dNqll_xx.detach()
+    else:
+        # No diffusion -> second derivative not needed.
+        dNqll_xx = None
 
     # Return relevant gradients
-    return Ntot_t.detach(), Nqll_t.detach(), Nqll_xx.detach()
+    return dNtot_t.detach(), dNqll_t.detach(), dNqll_xx
     # TODO - verify why detach() is important here
 
 def get_misc_params():
@@ -230,7 +233,8 @@ def get_misc_params():
 def f1d_solve_ivp_dimensionless(Ntot, Nqll, dNqll_dxx, scalar_params):
     """
     Adapted from QLCstuff2, this function computes the right-hand side of
-    the two objective functions that make up the QLC system.
+    the two objective functions that make up the QLC system. If you want
+    to disable diffusion, pass None to dNqll_dxx.
     
     Returns:
         [dNtot_dt, dNqll_dt]
@@ -241,14 +245,17 @@ def f1d_solve_ivp_dimensionless(Ntot, Nqll, dNqll_dxx, scalar_params):
     m = (Nqll - (NBAR - NSTAR))/(2*NSTAR)
     sigma_m = (sigmaI - m * sigma0)
     dNtot_dt = omega_kin * sigma_m
-    dNtot_dt += dNqll_dxx 
+    
+    # If diffusion is active, add diffusion term to dNtot_dt
+    if dNqll_dxx is not None:
+        dNtot_dt += dNqll_dxx 
     # NQLL    
     dNqll_dt = dNtot_dt - (Nqll - (NBAR - NSTAR*torch.sin(2*np.pi*Ntot)))
     
     # Package for output
     return dNtot_dt, dNqll_dt
 
-def calc_cp_loss(model: IcePINN, coords, params, epochs, epoch, print_every, print_gradients):
+def calc_cp_loss(model: IcePINN, coords, params, epochs, epoch, print_every, print_gradients, diffusion):
     """Calculates collocation point loss.
 
     Args:
@@ -262,7 +269,7 @@ def calc_cp_loss(model: IcePINN, coords, params, epochs, epoch, print_every, pri
     ys = enforced_model(coords, model)
     
     # Calculate and extract gradients
-    dNtot_dt, dNqll_dt, dNqll_dxx = ip.compute_loss_gradients(coords, ys)
+    dNtot_dt, dNqll_dt, dNqll_dxx = ip.compute_loss_gradients(coords, ys, diffusion)
     if (((epoch+1) % print_every) == 0) and print_gradients:
         print(f"Gradients: {dNtot_dt}, {dNqll_dt}, {dNqll_dxx}.")
 
@@ -278,7 +285,7 @@ def calc_cp_loss(model: IcePINN, coords, params, epochs, epoch, print_every, pri
     # [dNtot_dt - dNtot_dt_rhs, dNqll_dt - dNqll_dt_rhs]
     return torch.square(cat_test)
 
-def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, name, print_every, print_gradients=False, LR_scheduler=None):
+def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, name, print_every, print_gradients=False, diffusion=True, LR_scheduler=None):
 
     save_path = './models/'+name
     if not os.path.exists(save_path):
@@ -301,7 +308,7 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, name, print_e
         optimizer.zero_grad() 
 
         # evaluate collocation point loss
-        loss = ip.calc_cp_loss(model, training_set, params, epochs, epoch, print_every, print_gradients)
+        loss = ip.calc_cp_loss(model, training_set, params, epochs, epoch, print_every, print_gradients, diffusion)
         Ntot_loss = torch.sum(loss[:, 0]).item()
         Nqll_loss = torch.sum(loss[:, 1]).item()
 
