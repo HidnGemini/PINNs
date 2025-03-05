@@ -328,6 +328,15 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, name, print_e
             else:
                 this_epoch = this_epoch / 1000
             print(f"Epoch [{this_epoch}k/{epochs//1000}k] at {minutes}m {seconds}s: Ntot = {Ntot_loss:.3f}, Nqll = {Nqll_loss:.3f}, LR = {optimizer.param_groups[0]['lr']}")
+
+            if ((epoch+1) % (epochs//10)) == 0:
+                tenths_elapsed = (epoch+1) // (epochs//10)
+                tenths_remaining = 10 - tenths_elapsed
+                time_remaining = (elapsed // tenths_elapsed) * tenths_remaining
+                minutes = int(time_remaining // 60)
+                seconds = int(time_remaining % 60)
+                if tenths_remaining is not 0:
+                    print(f"Training {tenths_elapsed}/10 complete! Estimated time remaining: {minutes}m {seconds}s")
             
         # backward and optimize
         loss.backward(torch.ones_like(loss)) # Computes loss gradients
