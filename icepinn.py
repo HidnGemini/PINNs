@@ -72,38 +72,57 @@ class IcePINN(nn.Module):
         x = self.fc_out(x)
         return x
 
-def enforced_model(coords, model: IcePINN):
+def enforced_model(coords, model: IcePINN, enforce_IC=True, factor=1.0):
     """
     Wrap IcePINN models in this function for training and evaluation to hard-enforce
-    the initial condition using reparameterization.
+    the initial condition using reparameterization. To gradually enforce IC during 
+    curriculum learning over an adjustment period, set factor to a fraction representing
+    how much of the adjustment period has elapsed. 
 
     Args:
       coords: Tensor of shape [batch_size, 2], where the first column is x and the second is t.
       model: Neural network that takes the full coordinate tensor [x, t] and outputs a tensor of shape [batch_size, 2],
              corresponding to [NN_tot, NN_qll].
+      enforce_IC: Boolean, whether the IC should be enforced. When False, output is like calling model(coords).
+               True by default.
+      factor: float fraction ranging from (0, 1]. Determines how much the IC is enforced, where 1 is full enforcement. 
+              If no enforcement (factor=0) is desired, use enforce_IC=False instead. Used for gradual enforcement of IC during training.
+              1.0 by default.
     
     Returns:
       Tensor of shape [batch_size, 2] where:
-        - Column 0 is Ntot, satisfying Ntot(x, 0) = 1.
-        - Column 1 is Nqll, satisfying Nqll(x, 0) = get_Nqll(Ntot(x, 0)).
-    """    
-    # Extract t from the coordinates tensor
-    t = coords[:, 1:2]
-    
+        - Column 0 is Ntot
+        - Column 1 is Nqll
+      If enforce_IC=True and factor=1.0, output satisfies Ntot(x, 0) = 1 and Nqll(x, 0) = get_Nqll(Ntot(x, 0)).
+      If enforce_IC=True and factor<1.0, output will partially enforce these conditions.
+    """        
     # Get the raw outputs from the network
     nn_out = model(coords)  # Expecting shape [batch_size, 2]
     NN_tot = nn_out[:, 0:1]
     NN_qll = nn_out[:, 1:2]
     
-    # Reparameterize to enforce the initial conditions:
-    # For Ntot: initial condition is 1.
-    Ntot = 1.0 + t * NN_tot
+    if enforce_IC:
+        # Extract t from the coordinates tensor
+        t = coords[:, 1:2]
+
+        # Scale t values if necessary
+        if factor != 1.0:
+            t = 1+(t-1)*factor
+        
+        # Reparameterize to enforce the initial conditions
+        # Ntot: initial condition is 1. factor = 1 when IC is fully enforced.
+        Ntot = factor + t * NN_tot
+        
+        # Nqll: initial condition is get_Nqll(Ntot_initial)
+        Nqll = (factor*get_Nqll(1.0)) + t * NN_qll
+        
+        # Output as tensor with same shape as coords ([batch_size, 2])
+        return torch.cat([Ntot, Nqll], dim=1)
+
+    # If enforce is False, return output of model(coords)
+    return nn_out
+        
     
-    # For Nqll: initial condition is get_Nqll(1)
-    Nqll = get_Nqll(1.0) + t * NN_qll
-    
-    # Concatenate the outputs to form a tensor with the same shape as coords ([batch_size, 2])
-    return torch.cat([Ntot, Nqll], dim=1)
 
 def get_Nqll(Ntot):
     return NBAR - NSTAR*np.sin(2*np.pi*Ntot)
@@ -255,7 +274,7 @@ def f1d_solve_ivp_dimensionless(Ntot, Nqll, dNqll_dxx, scalar_params):
     # Package for output
     return dNtot_dt, dNqll_dt
 
-def calc_cp_loss(model: IcePINN, coords, params, epochs, epoch, print_every, print_gradients, diffusion):
+def calc_cp_loss(model: IcePINN, coords, params, diffusion=True, epoch=0, enforce_IC=True, adjustment_period=0):
     """Calculates collocation point loss.
 
     Args:
@@ -265,13 +284,15 @@ def calc_cp_loss(model: IcePINN, coords, params, epochs, epoch, print_every, pri
     Returns:
         (Ntot-loss, Nqll-loss), or a tensor of input shape containing (Ntot-loss, Nqll-loss) pairs.
     """
+    adjustment_factor = 1.0
+    if enforce_IC and (epoch < adjustment_period):
+        adjustment_factor = epoch/adjustment_period
+    
     # model predicts output of training_set as batch
-    ys = enforced_model(coords, model)
+    ys = enforced_model(coords, model, enforce_IC=enforce_IC, factor=adjustment_factor)
     
     # Calculate and extract gradients
     dNtot_dt, dNqll_dt, dNqll_dxx = ip.compute_loss_gradients(coords, ys, diffusion)
-    if (((epoch+1) % print_every) == 0) and print_gradients:
-        print(f"Gradients: {dNtot_dt}, {dNqll_dt}, {dNqll_dxx}.")
 
     # Compute expected output
     Ntot, Nqll = ys[:, 0], ys[:, 1]
@@ -285,13 +306,31 @@ def calc_cp_loss(model: IcePINN, coords, params, epochs, epoch, print_every, pri
     # [dNtot_dt - dNtot_dt_rhs, dNqll_dt - dNqll_dt_rhs]
     return torch.square(cat_test)
 
-def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, name, print_every, print_gradients=False, diffusion=True, LR_scheduler=None):
+def train_IcePINN(
+    model: IcePINN, 
+    optimizer, 
+    training_set, 
+    epochs, 
+    name, 
+    print_every, 
+    diffusion=True, 
+    LR_scheduler=None, 
+    enforce_IC=True,
+    adjustment_period=0):
 
+    # Create folder to store model in if necessary
     save_path = './models/'+name
     if not os.path.exists(save_path):
         os.makedirs(save_path)
 
     print(f"Commencing PINN training on {len(training_set)} points for {epochs} epochs.")
+
+    if enforce_IC:
+        save_path +='/params.pth'
+        print(f"IC is enforced with an adjustment period of {adjustment_period}.")
+    else:
+        save_path +='/pre_IC_params.pth'
+        print("IC is not enforced.")
 
     # Retrieve miscellaneous params for loss calculation
     params = ip.get_misc_params()
@@ -308,10 +347,32 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, name, print_e
         optimizer.zero_grad() 
 
         # evaluate collocation point loss
-        loss = ip.calc_cp_loss(model, training_set, params, epochs, epoch, print_every, print_gradients, diffusion)
+        loss = ip.calc_cp_loss(
+            model, 
+            training_set, 
+            params, 
+            diffusion=diffusion, 
+            epoch=epoch,  
+            enforce_IC = enforce_IC,
+            adjustment_period = adjustment_period)
         Ntot_loss = torch.sum(loss[:, 0]).item()
         Nqll_loss = torch.sum(loss[:, 1]).item()
 
+        # This heuristic for best model isn't perfect, but it's a good start
+        # Models will not be saved during adjustment period
+        if epoch >= adjustment_period and (Ntot_loss < min_Ntot_loss or Nqll_loss < min_Nqll_loss):
+            # TODO: determine which model to save using a discrete testing set?
+
+            # Save model (not including initial condition wrapper)
+            torch.save(model.state_dict(), save_path)
+            best_model_epoch = epoch
+            if Ntot_loss < min_Ntot_loss:
+                min_Ntot_loss = Ntot_loss
+            else:
+                min_Nqll_loss = Nqll_loss
+            best_model_Ntot_loss = Ntot_loss
+            best_model_Nqll_loss = Nqll_loss
+        
         if LR_scheduler is not None:
             LR_scheduler.step(Ntot_loss+Nqll_loss)
 
@@ -329,7 +390,7 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, name, print_e
                 this_epoch = this_epoch / 1000
             print(f"Epoch [{this_epoch}k/{epochs//1000}k] at {minutes}m {seconds}s: Ntot = {Ntot_loss:.3f}, Nqll = {Nqll_loss:.3f}, LR = {optimizer.param_groups[0]['lr']}")
 
-        if ((epoch+1) % (epochs//10)) == 0:
+        if (epoch+1) % (epochs//10) == 0:
             elapsed = time.time() - start_time
             tenths_elapsed = (epoch+1) // (epochs//10)
             tenths_remaining = 10 - tenths_elapsed
@@ -340,26 +401,18 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, name, print_e
             c_seconds = int(completion_estimate % 60)
             r_minutes = int(time_remaining // 60)
             r_seconds = int(time_remaining % 60)
-            if tenths_remaining is not 0:
+            if epochs - epoch+1 > epochs//10:
                 print(f"Training {tenths_elapsed}/10ths complete! Completion estimate: {c_minutes}m {c_seconds}s | {r_minutes}m {r_seconds}s remaining.")
             
-            print(f'Best model saved so far: Epoch {best_model_epoch+1}; Loss: {best_model_Ntot_loss:.3f} Ntot, {best_model_Nqll_loss:.3f} Nqll')
+            if epoch > adjustment_period:
+                print(f'Best model saved so far: Epoch {best_model_epoch+1}; Loss: {best_model_Ntot_loss:.3f} Ntot, {best_model_Nqll_loss:.3f} Nqll')
+            
+        if epoch+1 == adjustment_period:
+            print("Adjustment period is complete! IC is now being fully enforced.")
             
         # backward and optimize
         loss.backward(torch.ones_like(loss)) # Computes loss gradients
         optimizer.step() # Adjusts weights accordingly
-
-        # This heuristic for best model isn't perfect, but it's a good start
-        if Ntot_loss < min_Ntot_loss or Nqll_loss < min_Nqll_loss:
-            # Save model (not including initial condition wrapper)
-            torch.save(model.state_dict(), save_path+'/params.pth')
-            best_model_epoch = epoch
-            if Ntot_loss < min_Ntot_loss:
-                min_Ntot_loss = Ntot_loss
-            else:
-                min_Nqll_loss = Nqll_loss
-            best_model_Ntot_loss = Ntot_loss
-            best_model_Nqll_loss = Nqll_loss
 
     elapsed = time.time() - start_time
     minutes = int(elapsed // 60)
@@ -369,13 +422,19 @@ def train_IcePINN(model: IcePINN, optimizer, training_set, epochs, name, print_e
     print(f'Saved model Ntot loss: {best_model_Ntot_loss:.3f}.')
     print(f'Saved model Nqll loss: {best_model_Nqll_loss:.3f}.')
 
-def load_IcePINN(model_name):
+def load_IcePINN(model_name, pre_IC=False):
     """
     Loads a saved IcePINN.
     Args:
         model_name: String name of folder model is stored in
+        pre_IC: Boolean; should the best pre initial condition enforcement model
+                be loaded? Default is False, which loads best model with IC enforced.
     """
-    path = './models/'+model_name+'/params.pth'
+    path = './models/'+model_name
+    if pre_IC:
+        path +='/pre_IC_params.pth'
+    else:
+        path +='/params.pth'
     state_dict = torch.load(path)
     model_dimensions = state_dict['dimensions']
     is_sf_PINN = state_dict['is_sf_PINN']
