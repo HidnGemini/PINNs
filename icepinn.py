@@ -72,7 +72,7 @@ class IcePINN(nn.Module):
         x = self.fc_out(x)
         return x
 
-def enforced_model(coords, model: IcePINN, enforce_IC=True, factor=1.0):
+def enforced_model(coords, model: IcePINN, hard_enforce_IC=True, factor=1.0):
     """
     Wrap IcePINN models in this function for training and evaluation to hard-enforce
     the initial condition using reparameterization. To gradually enforce IC during 
@@ -98,12 +98,11 @@ def enforced_model(coords, model: IcePINN, enforce_IC=True, factor=1.0):
     """        
     # Get the raw outputs from the network
     nn_out = model(coords)  # Expecting shape [batch_size, 2]
-    NN_tot = nn_out[:, 0:1]
-    NN_qll = nn_out[:, 1:2]
     
-    if enforce_IC:
-        # Extract t from the coordinates tensor
+    if hard_enforce_IC:
         t = coords[:, 1:2]
+        NN_tot = nn_out[:, 0:1]
+        NN_qll = nn_out[:, 1:2]
 
         # Scale t values if necessary
         if factor != 1.0:
@@ -114,18 +113,16 @@ def enforced_model(coords, model: IcePINN, enforce_IC=True, factor=1.0):
         Ntot = factor + t * NN_tot
         
         # Nqll: initial condition is get_Nqll(Ntot_initial)
-        Nqll = (factor*get_Nqll(1.0)) + t * NN_qll
+        Nqll = (factor*get_Nqll(torch.tensor(1.0))) + t * NN_qll
         
         # Output as tensor with same shape as coords ([batch_size, 2])
         return torch.cat([Ntot, Nqll], dim=1)
 
     # If enforce is False, return output of model(coords)
     return nn_out
-        
-    
 
 def get_Nqll(Ntot):
-    return NBAR - NSTAR*np.sin(2*np.pi*Ntot)
+    return torch.tensor(NBAR - NSTAR*torch.sin(2*np.pi*Ntot)).to(device)
 
 def init_HE(m):
     # We don't want to interfere with custom initialization of SinusoidalMappingLayer
@@ -138,7 +135,7 @@ def get_device():
 def compute_loss_gradients(xs, ys, diffusion):
     """
     Computes gradients needed to compute collocation point loss. 
-    Expects batched input with requires_grad=TRUE.
+    Expects batched input.
     Args:
         xs: xs[0] = x, xs[1] = t
         ys: ys[0] = Ntot, ys[1] = Nqll
@@ -252,8 +249,9 @@ def get_misc_params():
 def f1d_solve_ivp_dimensionless(Ntot, Nqll, dNqll_dxx, scalar_params):
     """
     Adapted from QLCstuff2, this function computes the right-hand side of
-    the two objective functions that make up the QLC system. If you want
-    to disable diffusion, pass None to dNqll_dxx.
+    the two objective functions that make up the QLC system. This is being
+    used to compute collocation point loss. If you want to disable diffusion, 
+    pass None to dNqll_dxx.
     
     Returns:
         [dNtot_dt, dNqll_dt]
@@ -274,7 +272,16 @@ def f1d_solve_ivp_dimensionless(Ntot, Nqll, dNqll_dxx, scalar_params):
     # Package for output
     return dNtot_dt, dNqll_dt
 
-def calc_cp_loss(model: IcePINN, coords, params, diffusion=True, epoch=0, enforce_IC=True, adjustment_period=0):
+def calc_cp_loss(
+    model: IcePINN, 
+    coords, 
+    params, 
+    diffusion=True, 
+    epoch=0, 
+    enforce_IC=True, 
+    hard_enforce_IC=True, 
+    adjustment_period=0):
+
     """Calculates collocation point loss.
 
     Args:
@@ -285,11 +292,11 @@ def calc_cp_loss(model: IcePINN, coords, params, diffusion=True, epoch=0, enforc
         (Ntot-loss, Nqll-loss), or a tensor of input shape containing (Ntot-loss, Nqll-loss) pairs.
     """
     adjustment_factor = 1.0
-    if enforce_IC and (epoch < adjustment_period):
-        adjustment_factor = epoch/adjustment_period
+    if hard_enforce_IC and (epoch < adjustment_period):
+        adjustment_factor = np.sqrt(epoch/adjustment_period)
     
     # model predicts output of training_set as batch
-    ys = enforced_model(coords, model, enforce_IC=enforce_IC, factor=adjustment_factor)
+    ys = enforced_model(coords, model, hard_enforce_IC=hard_enforce_IC, factor=adjustment_factor)
     
     # Calculate and extract gradients
     dNtot_dt, dNqll_dt, dNqll_dxx = ip.compute_loss_gradients(coords, ys, diffusion)
@@ -300,11 +307,27 @@ def calc_cp_loss(model: IcePINN, coords, params, diffusion=True, epoch=0, enforc
     
     # dNtot_dt = Nqll*surface_diff_coefficient + w_kin*sigma_m
     # dNqll_dt = dNtot/dt - (Nqll - Nqll_eq)
-    cat_test = torch.stack((dNtot_dt - dNtot_dt_rhs, dNqll_dt - dNqll_dt_rhs), axis=1)
+    unsquared_loss = torch.stack(((dNtot_dt - dNtot_dt_rhs), (dNqll_dt - dNqll_dt_rhs)), axis=1)
+
+    if enforce_IC and not hard_enforce_IC:
+        # Soft IC enforcement: add penalty for deviation from IC.
+        # NOTE: nx_crystal MUST be consistent with the number of points being sampled
+        #   at t=0, or this will not penalize as intended. If implementing random 
+        #   collocation points each epoch, will have to do dedicated loss calculation
+        #   for a set of points at t=0 instead of re-using the first nx_crystal predictions.
+
+        # Predictions at t=0
+        Ntot_t0, Nqll_t0 = Ntot[0:nx_crystal], Nqll[0:nx_crystal]
+
+        # Difference between predictions at t=0 and IC
+        unsquared_IC_loss = torch.stack((Ntot_t0 - Ntot_init, Nqll_t0 - Nqll_init), axis=1)
+        
+        # Combine losses
+        unsquared_loss = torch.concat((unsquared_IC_loss, unsquared_loss))
     
-    # Return squared loss as tensor of shape (len(coords), 2)
+    # Return L2 loss (squared loss) as tensor of shape (len(coords), 2)
     # [dNtot_dt - dNtot_dt_rhs, dNqll_dt - dNqll_dt_rhs]
-    return torch.square(cat_test)
+    return torch.square(unsquared_loss)
 
 def train_IcePINN(
     model: IcePINN, 
@@ -316,10 +339,12 @@ def train_IcePINN(
     diffusion=True, 
     LR_scheduler=None, 
     enforce_IC=True,
+    hard_enforce_IC=True,
     adjustment_period=0):
 
-    # Create folder to store model in if necessary
     save_path = './models/'+name
+
+    # Create folder to store model in if necessary
     if not os.path.exists(save_path):
         os.makedirs(save_path)
 
@@ -331,6 +356,16 @@ def train_IcePINN(
     else:
         save_path +='/pre_IC_params.pth'
         print("IC is not enforced.")
+
+    ## Concepts of a plan, but would require reworking load_model() and I can't deal
+    # if enforce_IC:
+    #     best_save_path +='/best_params.pth'
+    #     last_save_path +='/last_params.pth'
+    #     print(f"IC is enforced with an adjustment period of {adjustment_period}.")
+    # else:
+    #     best_save_path +='/best_pre_IC_params.pth'
+    #     last_save_path +='/last_pre_IC_params.pth'
+    #     print("IC is not enforced.")
 
     # Retrieve miscellaneous params for loss calculation
     params = ip.get_misc_params()
@@ -354,6 +389,7 @@ def train_IcePINN(
             diffusion=diffusion, 
             epoch=epoch,  
             enforce_IC = enforce_IC,
+            hard_enforce_IC = hard_enforce_IC,
             adjustment_period = adjustment_period)
         Ntot_loss = torch.sum(loss[:, 0]).item()
         Nqll_loss = torch.sum(loss[:, 1]).item()
@@ -376,6 +412,7 @@ def train_IcePINN(
         if LR_scheduler is not None:
             LR_scheduler.step(Ntot_loss+Nqll_loss)
 
+        # Print training progress in [print_every] intervals
         if ((epoch+1) % print_every) == 0:
             current_lr = optimizer.param_groups[0]['lr']
             
@@ -390,6 +427,8 @@ def train_IcePINN(
                 this_epoch = this_epoch / 1000
             print(f"Epoch [{this_epoch}k/{epochs//1000}k] at {minutes}m {seconds}s: Ntot = {Ntot_loss:.3f}, Nqll = {Nqll_loss:.3f}, LR = {optimizer.param_groups[0]['lr']}")
 
+        # Print time completion estimate and best model saved thus far
+        # as each tenth of total training epochs elapses
         if (epoch+1) % (epochs//10) == 0:
             elapsed = time.time() - start_time
             tenths_elapsed = (epoch+1) // (epochs//10)
@@ -412,6 +451,10 @@ def train_IcePINN(
             
         # backward and optimize
         loss.backward(torch.ones_like(loss)) # Computes loss gradients
+
+        # Gradient clipping to mitigate exploding gradients
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, norm_type=2)
+
         optimizer.step() # Adjusts weights accordingly
 
     elapsed = time.time() - start_time
@@ -428,7 +471,7 @@ def load_IcePINN(model_name, pre_IC=False):
     Args:
         model_name: String name of folder model is stored in
         pre_IC: Boolean; should the best pre initial condition enforcement model
-                be loaded? Default is False, which loads best model with IC enforced.
+                be loaded? Default is False, which loads best model trained with IC enforced.
     """
     path = './models/'+model_name
     if pre_IC:
@@ -472,7 +515,7 @@ NUM_T_STEPS = RUNTIME + 1
 #NUM_T_STEPS = RUNTIME*5 + 1
 
 # Define initial conditions
-Ntot_init = np.ones(nx_crystal)
+Ntot_init = torch.ones(nx_crystal).to(device)
 Nqll_init = get_Nqll(Ntot_init)
 
 # Define x, t pairs for training
