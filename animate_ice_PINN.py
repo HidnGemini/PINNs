@@ -19,8 +19,8 @@ L = GI['L']
 
 # TODO - let user choose runtime when calling functions
 # Define time constants
-RUNTIME = 5
-NUM_T_STEPS = RUNTIME+1
+RUNTIME = 10
+NUM_T_STEPS = 100*RUNTIME+1
 
 # Define x values for plotting
 X_QLC = np.linspace(-L,L,nx_crystal)
@@ -28,15 +28,27 @@ t_points = np.linspace(0, RUNTIME, NUM_T_STEPS)
 x, t = np.meshgrid(X_QLC, t_points)
 TEST_SET = torch.tensor(np.column_stack((x.flatten(), t.flatten()))).to(device)
 
-TITLE_DICT = {0: "Ntot", 1: "Nqll", 2: "N-ice"}
+TITLE_DICT = {0: "N-tot", 1: "N-qll", 2: "N-ice"}
 
-def animate_refsol(index, frame_interval = 50, with_diffusion=True):
+def save_ani_as_gif(animation, file_name, frame_interval):
+    """
+    Saves animation as a gif.
+    """
+    
+    writer = ani.PillowWriter(fps=(1000//frame_interval))
+    animation.save(file_name+".gif", writer=writer)
+    print("Animation saved successfully as "+file_name)
+
+def animate_refsol(index, frame_interval = 50, with_diffusion=True, file_name=None):
     """
     Animates reference solution.
 
     Args:
         index: 0 for Ntot, 1 for Nqll, 2 for N-ice
         frame_interval: time in ms that each frame should remain on screen
+        with_diffusion: Should the reference solution include diffusion? True or False, True by default.
+        file_name: Name of file to save animation as (excluding filetype), or None to not save animation.
+            None by default. Animation is saved as a gif.
     """
     REFERENCE_SOLUTION = refsol.generate_reference_solution(runtime=RUNTIME, num_steps=NUM_T_STEPS, with_diffusion=with_diffusion)
 
@@ -66,10 +78,14 @@ def animate_refsol(index, frame_interval = 50, with_diffusion=True):
 
     # animation!
     animation = ani.FuncAnimation(fig=fig, func=update, frames=frames, interval=frame_interval)
+
+    if file_name is not None:
+        save_ani_as_gif(animation, file_name, frame_interval)
+
     # show me the money
     plt.show()
 
-def animate_IcePINN(model_name, index, frame_interval = 50):
+def animate_IcePINN(model_name, index, frame_interval = 50, file_name=None):
     """
     Animates PINN model output.
 
@@ -77,6 +93,8 @@ def animate_IcePINN(model_name, index, frame_interval = 50):
         model_name: String name of folder model is stored in
         index: 0 for Ntot, 1 for Nqll, 2 for N-ice
         frame_interval: time in ms that each frame should remain on screen
+        file_name: Name of file to save animation as (excluding filetype), or None to not save animation.
+            None by default. Animation is saved as a gif.
     """
     loaded_model = ip.load_IcePINN(model_name)
     loaded_model.eval()
@@ -120,33 +138,43 @@ def animate_IcePINN(model_name, index, frame_interval = 50):
 
     # animation!
     animation = ani.FuncAnimation(fig=fig, func=update, frames=frames, interval=frame_interval)
+
+    if file_name is not None:
+        save_ani_as_gif(animation, file_name, frame_interval)
+
     # show me the money
     plt.show()
 
 
-def animate_together(model1_name, model2_name, index, frame_interval = 50):
+def animate_together(model1_name, model2_name, index1, index2 = None, frame_interval = 50, file_name=None):
     """
     Animates PINN model output superimposed on reference solution.
 
     Args:
         model1_name: String name of folder model is stored in, or reference solution if None.
         model2_name: String name of folder model is stored in, or reference solution if None.
-        index: 0 for Ntot, 1 for Nqll, 2 for N-ice
-        frame_interval: time in ms that each frame should remain on screen
+        index: 0 for Ntot, 1 for Nqll, 2 for N-ice.
+        index2: 0 for Ntot, 1 for Nqll, 2 for N-ice, or None to match index. None by default.
+        frame_interval: time in ms that each frame should remain on screen. 50 by default.
+        file_name: Name of file to save animation as (excluding filetype), or None to not save animation.
+            None by default. Animation is saved as a gif.
     """
     # Yes I know there is some egregious code duplication and the next 20 lines should
     # go into a helper method. I realized once it was done and I'm not changing it.
 
     model1_solution = "foo"
     model2_solution = "bar"
+
+    if index2 is None:
+        index2 = index
     
     if model1_name is True or model1_name is False:
         # Generate reference solution
         model1_solution = refsol.generate_reference_solution(runtime=RUNTIME, num_steps=NUM_T_STEPS, with_diffusion=model1_name)
         if model1_name is False:
-            model1_name = "Reference Solution (without diffusion)"
+            model1_name = "Reference "+TITLE_DICT[index1]+"(without diffusion)"
         else:
-            model1_name = "Reference Solution (with diffusion)"
+            model1_name = "Reference "+TITLE_DICT[index1]+"(with diffusion)"
     else:
         model1 = ip.load_IcePINN(model1_name)
         model1.eval()
@@ -167,9 +195,9 @@ def animate_together(model1_name, model2_name, index, frame_interval = 50):
         # Generate reference solution
         model2_solution = refsol.generate_reference_solution(runtime=RUNTIME, num_steps=NUM_T_STEPS, with_diffusion=model2_name)
         if model2_name is False:
-            model2_name = "Reference Solution (without diffusion)"
+            model2_name = "Reference "+TITLE_DICT[index2]+"(without diffusion)"
         else:
-            model2_name = "Reference Solution (with diffusion)"
+            model2_name = "Reference "+TITLE_DICT[index2]+"(with diffusion)"
     else:
         model2 = ip.load_IcePINN(model2_name)
         model2.eval()
@@ -188,10 +216,10 @@ def animate_together(model1_name, model2_name, index, frame_interval = 50):
 
     # set up graph
     fig, ax = plt.subplots()
-    ax.set(xlim=[-L, L], xlabel="x (micrometers)", ylabel="Number of Ice Layers", title="Predicted "+TITLE_DICT[index]) # set axes
+    ax.set(xlim=[-L, L], xlabel="x (micrometers)", ylabel="Number of Ice Layers", title="Predicted "+TITLE_DICT[index1]) # set axes
 
-    lines = ax.plot(X_QLC, model1_solution[index][0], 'b', linewidth=1.0, label=model1_name, zorder=2)
-    lines.append(ax.plot(X_QLC, model2_solution[index][0], 'r', linewidth=1.0, label=model2_name, zorder=0)[0])
+    lines = ax.plot(X_QLC, model1_solution[index1][0], 'b', linewidth=1.0, label=model1_name, zorder=2)
+    lines.append(ax.plot(X_QLC, model2_solution[index2][0], 'r', linewidth=1.0, label=model2_name, zorder=0)[0])
     ax.legend()
 
     # list of frames to iterate through (a list of unique times)
@@ -201,8 +229,8 @@ def animate_together(model1_name, model2_name, index, frame_interval = 50):
     def update(frame):
 
         # select y values that correspond to the frame in question
-        ref_y = model1_solution[index][frame]
-        net_y = model2_solution[index][frame]
+        ref_y = model1_solution[index1][frame]
+        net_y = model2_solution[index2][frame]
         
         # Update y-axis limits to fit the data
         ax.set_ylim(np.min([np.min(net_y), np.min(ref_y)]), np.max([np.max(net_y), np.max(ref_y)]))
@@ -215,6 +243,10 @@ def animate_together(model1_name, model2_name, index, frame_interval = 50):
 
     # animation!
     animation = ani.FuncAnimation(fig=fig, func=update, frames=frames, interval=frame_interval)
+    
+    if file_name is not None:
+        save_ani_as_gif(animation, file_name, frame_interval)
+    
     # show me the money
     plt.show()
     
