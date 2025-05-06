@@ -1,5 +1,5 @@
 */ 
 PyTorch_CrashCourse.ipynb
-test.py 
-notes_for_nesh.txt
+*.txt
 *.gif
+!requirements.txt
