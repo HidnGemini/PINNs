@@ -22,6 +22,9 @@ class SinActivation(nn.Module):
         return torch.sin(x)
 
 class SinusoidalMappingLayer(nn.Module):
+    """
+    Custom-instantiated layer of sin activations, defined here: https://arxiv.org/pdf/2109.09338
+    """
     def __init__(self, input_dim, num_features, sigma=1.0):
         super(SinusoidalMappingLayer, self).__init__()
         self.num_features = num_features
@@ -39,10 +42,17 @@ class SinusoidalMappingLayer(nn.Module):
 # Difference between nn._ and nn.functional._ is that functional is stateless: 
 # https://stackoverflow.com/questions/63826328/torch-nn-functional-vs-torch-nn-pytorch
 class IcePINN(nn.Module):
+    """
+    This IcePINN class can be instantiated as one of two options:
+    - A standard feed-forward neural network
+    - An "sf_PINN" with a layer of sin functions instantiated as specified in this paper:
+        https://arxiv.org/pdf/2109.09338
+    
+    """
     def __init__(self, num_hidden_layers, hidden_layer_size, is_sf_PINN=False):
         super().__init__()
         self.is_sf = is_sf_PINN
-        self.sml = SinusoidalMappingLayer(2, hidden_layer_size*3) # Consider fiddling with sigma
+        self.sml = SinusoidalMappingLayer(2, hidden_layer_size*3, sigma=1.0) # Consider fiddling with sigma
         self.post_sml = nn.Linear(hidden_layer_size*3, hidden_layer_size)
         
         self.sin = SinActivation()
@@ -58,7 +68,7 @@ class IcePINN(nn.Module):
 
     def forward(self, x):
         if self.is_sf:
-            # Sinusoidal mapping of inputs: Increases initial gradient variability.
+            # Sinusoidal mapping of inputs: Increases initial gradient variability. https://arxiv.org/pdf/2109.09338 
             # This makes it less likely for the PINN to get stuck in local minima at the start of training.
             x = self.sml(x) 
             x = F.tanh(self.post_sml(x))
@@ -72,6 +82,52 @@ class IcePINN(nn.Module):
         x = self.fc_out(x)
         return x
 
+class NtotPINN(nn.Module):
+    """
+    This NN only predicts Ntot internally. The forward method 
+    returns a (batch_size, 2) tensor containing (Ntot, NqllEQ(Ntot))
+    pairs derived from Nqll.
+
+    NOTE: this is currently an untested proof-of-concept.
+    """
+    def __init__(self, num_hidden_layers, hidden_layer_size, is_sf_PINN=False):
+        # same as IcePINN except out is just Ntot
+        super().__init__()
+        self.is_sf = is_sf_PINN
+        self.sml = SinusoidalMappingLayer(2, hidden_layer_size*3) # Consider fiddling with sigma
+        self.post_sml = nn.Linear(hidden_layer_size*3, hidden_layer_size)
+        
+        self.sin = SinActivation()
+        
+        self.fc_in = nn.Linear(2, hidden_layer_size)
+        self.post_fc_in = nn.Linear(hidden_layer_size, hidden_layer_size)
+
+        self.fc_hidden = nn.ModuleList()
+        for _ in range(num_hidden_layers-2):
+            self.fc_hidden.append(nn.Linear(hidden_layer_size, hidden_layer_size))
+            
+        self.fc_out = nn.Linear(hidden_layer_size, 1)
+
+    def forward(self, x):
+        if self.is_sf:
+            # Sinusoidal mapping of inputs: Increases initial gradient variability.
+            # This makes it less likely for the PINN to get stuck in local minima at the start of training.
+            x = self.sml(x) 
+            x = F.tanh(self.post_sml(x))
+        else:
+            x = F.tanh(self.fc_in(x))
+            x = F.tanh(self.post_fc_in(x))
+
+        for layer in self.fc_hidden:
+            x = F.tanh(layer(x))
+
+        Ntot = self.fc_out(x)   # Ntot has shape (batch_size, 1)
+
+        # Pass a 1D tensor (of shape (batch_size,)) into get_Nqll and then unsqueeze to restore the shape
+        NqllEQ = get_Nqll(Ntot[:, 0]).unsqueeze(1)  
+        x = torch.cat([Ntot, NqllEQ], dim=1)  # Concatenate to get a (batch_size, 2) tensor: (Ntot, NqllEQ)
+        return x
+
 def enforced_model(coords, model: IcePINN, hard_enforce_IC=True, factor=1.0):
     """
     Wrap IcePINN models in this function for training and evaluation to hard-enforce
@@ -83,7 +139,7 @@ def enforced_model(coords, model: IcePINN, hard_enforce_IC=True, factor=1.0):
       coords: Tensor of shape [batch_size, 2], where the first column is x and the second is t.
       model: Neural network that takes the full coordinate tensor [x, t] and outputs a tensor of shape [batch_size, 2],
              corresponding to [NN_tot, NN_qll].
-      enforce_IC: Boolean, whether the IC should be enforced. When False, output is like calling model(coords).
+      hard_enforce_IC: Boolean, whether the IC should be enforced. When False, output is like calling model(coords).
                True by default.
       factor: float fraction ranging from (0, 1]. Determines how much the IC is enforced, where 1 is full enforcement. 
               If no enforcement (factor=0) is desired, use enforce_IC=False instead. Used for gradual enforcement of IC during training.
@@ -122,6 +178,12 @@ def enforced_model(coords, model: IcePINN, hard_enforce_IC=True, factor=1.0):
     return nn_out
 
 def get_Nqll(Ntot):
+    """
+    Gets the EQUILIBRIUM LEVEL of Nqll for a given Ntot.
+    """
+    # This torch.tensor wrapper is a band-aid solution to it throwing a fit
+    # when I call this function with respect to device mismatching. Could probably fix.
+    # Currently this solution causes a "PyTorch is unhappy" print warning.
     return torch.tensor(NBAR - NSTAR*torch.sin(2*np.pi*Ntot)).to(device)
 
 def init_HE(m):
@@ -132,7 +194,7 @@ def init_HE(m):
 def get_device():
     return device
 
-def compute_loss_gradients(xs, ys, diffusion):
+def calc_loss_gradients(xs, ys, diffusion):
     """
     Computes gradients needed to compute collocation point loss. 
     Expects batched input.
@@ -246,17 +308,21 @@ def get_misc_params():
     # sigma0, sigmaI, omega_kin = params
     return sigma0, sigmaI, omega_kin
 
-def f1d_solve_ivp_dimensionless(Ntot, Nqll, dNqll_dxx, scalar_params):
+def calc_QLC_rhs(Ntot, Nqll, dNqll_dxx):
     """
-    Adapted from QLCstuff2, this function computes the right-hand side of
-    the two objective functions that make up the QLC system. This is being
-    used to compute collocation point loss. If you want to disable diffusion, 
-    pass None to dNqll_dxx.
+    This function computes the right-hand side of the two objective functions 
+    that form the QLC system. Thus the outputs should theoretically be equal to 
+    dNtot_dt and dNqll_dt. The outputs of this function are primarily used
+    to compute collocation point loss. 
+    
+    If you want to disable diffusion, pass None to dNqll_dxx.
+
+    This function is adapted from f1d_solve_ivp_dimensionless() in QLCstuff2.py
     
     Returns:
-        [dNtot_dt, dNqll_dt]
+        [dNtot_dt, dNqll_dt], or a 2D tensor containing len(input tensor) (dNtot_dt, dNqll_dt) pairs
     """
-    sigma0, sigmaI, omega_kin = scalar_params
+    sigma0, sigmaI, omega_kin = ip.get_misc_params()
 
     # Ntot deposition
     m = (Nqll - (NBAR - NSTAR))/(2*NSTAR)
@@ -272,21 +338,31 @@ def f1d_solve_ivp_dimensionless(Ntot, Nqll, dNqll_dxx, scalar_params):
     # Package for output
     return dNtot_dt, dNqll_dt
 
-def calc_cp_loss(
+def calc_IcePINN_loss(
     model: IcePINN, 
     coords, 
-    params, 
     diffusion=True, 
     epoch=0, 
     enforce_IC=True, 
     hard_enforce_IC=True, 
     adjustment_period=0):
 
-    """Calculates collocation point loss.
+    """
+    Custom loss function for IcePINNs. Given a set of training points, how incorrect
+    is the network prediction?
 
     Args:
-        coords: (x, t), or a tensor of size [2, batch_size] containing batch_size (x, t) coordinate pairs
-        params: output of get_misc_params()
+        model: IcePINN to be evaluated using 'coords'.
+        coords: (x, t), or a tensor of shape [batch_size, 2] containing batch_size (x, t) coordinate pairs.
+            These are the training points that 'model' is evaluated on.
+        diffusion: True if diffusion is enabled, False otherwise. True by default.
+        epoch: Number of training epochs elapsed thus far. 0 by default. Not relevant
+            unless doing curriculum learning.
+        enforce_IC: True if IC is being enforced, False otherwise. True by default.
+        hard_enforce_IC: True if IC is being hard enforced, False if being soft enforced
+            (which is the classical PINN approach). True by default.
+        adjustment_period: Number of epochs it takes to have IC fully enforced. 0 by default. 
+            Not relevant unless doing curriculum learning.
 
     Returns:
         (Ntot-loss, Nqll-loss), or a tensor of input shape containing (Ntot-loss, Nqll-loss) pairs.
@@ -299,11 +375,11 @@ def calc_cp_loss(
     ys = enforced_model(coords, model, hard_enforce_IC=hard_enforce_IC, factor=adjustment_factor)
     
     # Calculate and extract gradients
-    dNtot_dt, dNqll_dt, dNqll_dxx = ip.compute_loss_gradients(coords, ys, diffusion)
+    dNtot_dt, dNqll_dt, dNqll_dxx = ip.calc_loss_gradients(coords, ys, diffusion)
 
     # Compute expected output
     Ntot, Nqll = ys[:, 0], ys[:, 1]
-    dNtot_dt_rhs, dNqll_dt_rhs = ip.f1d_solve_ivp_dimensionless(Ntot, Nqll, dNqll_dxx, params)
+    dNtot_dt_rhs, dNqll_dt_rhs = ip.calc_QLC_rhs(Ntot, Nqll, dNqll_dxx)
     
     # dNtot_dt = Nqll*surface_diff_coefficient + w_kin*sigma_m
     # dNqll_dt = dNtot/dt - (Nqll - Nqll_eq)
@@ -335,12 +411,39 @@ def train_IcePINN(
     training_set, 
     epochs, 
     name, 
-    print_every, 
+    print_every=1_000, 
     diffusion=True, 
     LR_scheduler=None, 
     enforce_IC=True,
     hard_enforce_IC=True,
     adjustment_period=0):
+    """
+    This function serves as the training loop for IcePINNs. The model weights
+    are updated and stored within the model itself, so changes will be saved 
+    even if this function is terminated prematurely. After the first epoch
+    (or after the adjustment period has passed, if set),
+    model weights will only be saved to disc if the Ntot loss or Nqll loss
+    is lower than the lowest seen so far during this training run. 
+    Model weights will not be saved during the adjustment period if one is set.
+
+    Args:
+        model: Instantiated IcePINN model to train.
+        optimizer: Instantiated optimizer from the torch.optim library.
+        training_set: Set of points to train 'model' on.
+        epochs: Number of training epochs/iterations.
+        name: String name of model. Used to name the directory in which 'model' is saved.
+        print_every: How often training statistics are printed. 1000 by default.
+        diffusion: Whether model is being trained with NQLL surface diffusion active.
+            True by default. 
+        LR_scheduler: Instantiated learning rate scheduler from the torch.optim.lr_scheduler
+            library. Must be instantiated on same optimizer as 'optimizer' argument. None by default.
+        enforce_IC: Whether the initial condition is being enforced in training or not. True by default.
+        hard_enforce_IC: True if IC is being hard enforced, False if being soft enforced
+            (which is the classical PINN approach). True by default. Ignored if enforce_IC is False.
+        adjustment_period: Number of epochs it takes to have IC fully enforced. 0 by default. 
+            Not relevant unless doing curriculum learning. 
+
+    """
 
     save_path = './models/'+name
 
@@ -367,8 +470,7 @@ def train_IcePINN(
     #     last_save_path +='/last_pre_IC_params.pth'
     #     print("IC is not enforced.")
 
-    # Retrieve miscellaneous params for loss calculation
-    params = ip.get_misc_params()
+    # Used to determine when to save model weights to disk
     min_Ntot_loss = 10e12
     min_Nqll_loss = 10e12
     best_model_Ntot_loss = 10e12
@@ -381,11 +483,10 @@ def train_IcePINN(
         # Zero accumulated gradients so they don't affect future computations
         optimizer.zero_grad() 
 
-        # evaluate collocation point loss
-        loss = ip.calc_cp_loss(
+        # evaluate training loss
+        loss = ip.calc_IcePINN_loss(
             model, 
-            training_set, 
-            params, 
+            training_set,  
             diffusion=diffusion, 
             epoch=epoch,  
             enforce_IC = enforce_IC,
@@ -467,11 +568,13 @@ def train_IcePINN(
 
 def load_IcePINN(model_name, pre_IC=False):
     """
-    Loads a saved IcePINN.
+    Loads a saved IcePINN from disc.
     Args:
         model_name: String name of folder model is stored in
         pre_IC: Boolean; should the best pre initial condition enforcement model
                 be loaded? Default is False, which loads best model trained with IC enforced.
+    
+    Returns a freshly loaded IcePINN model instance.
     """
     path = './models/'+model_name
     if pre_IC:
@@ -496,9 +599,6 @@ def load_IcePINN(model_name, pre_IC=False):
     
     return loaded_model
 
-
-
-
 #region Data preparation/pre-processing
 
 # Read in GI parameters
@@ -510,8 +610,8 @@ NBAR = GI['Nbar']
 NSTAR = GI['Nstar']
 
 # Define t range (needs to be same as training file)
-RUNTIME = 5
-NUM_T_STEPS = RUNTIME + 1
+RUNTIME = 2
+NUM_T_STEPS = 100*RUNTIME + 1
 #NUM_T_STEPS = RUNTIME*5 + 1
 
 # Define initial conditions

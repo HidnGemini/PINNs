@@ -18,6 +18,8 @@ nx_crystal = GI['nx_crystal']
 L = GI['L']
 
 # TODO - let user choose runtime when calling functions
+# NOTE: for animating model outputs, this must match what the model was trained on.
+#   May want to save this in models in the future to amend this issue.
 # Define time constants
 RUNTIME = 10
 NUM_T_STEPS = 100*RUNTIME+1
@@ -30,9 +32,18 @@ TEST_SET = torch.tensor(np.column_stack((x.flatten(), t.flatten()))).to(device)
 
 TITLE_DICT = {0: "N-tot", 1: "N-qll", 2: "N-ice"}
 
-def save_ani_as_gif(animation, file_name, frame_interval):
+def save_ani_as_gif(animation, file_name, frame_interval = 20):
     """
-    Saves animation as a gif.
+    Saves animation to disk as a gif.
+
+    Args:
+        animation: a matplotlib.animation instance.
+        file_name: Name of file to save animation as (excluding filetype).
+        frame_interval: time in ms that each frame should remain on screen.
+            Default is 20, which results in 60FPS animations.
+            NOTE: This doesn't change the "resolution" of each frame or 
+                the number of total frames. This only affects how fast 
+                the frames are presented.
     """
     
     writer = ani.PillowWriter(fps=(1000//frame_interval))
