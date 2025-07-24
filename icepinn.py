@@ -350,9 +350,9 @@ def calc_IcePINN_loss(
     """
     Custom loss function for IcePINNs. Given a set of training points, how incorrect
     is the network prediction?
-
+I
     Args:
-        model: IcePINN to be evaluated using 'coords'.
+        model: IcePNN to be evaluated using 'coords'.
         coords: (x, t), or a tensor of shape [batch_size, 2] containing batch_size (x, t) coordinate pairs.
             These are the training points that 'model' is evaluated on.
         diffusion: True if diffusion is enabled, False otherwise. True by default.

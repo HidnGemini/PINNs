@@ -106,7 +106,7 @@ def run_f1d_dimensionless(\
         ylast = sol.y[:,-1]
         
         # Symmetrizing
-        ylast = np.array(ylast, dtype=np.complex_)
+        ylast = np.array(ylast, dtype=np.complex128)
         ylast_reshaped = np.reshape(ylast,(2,nx))
         NQLL_last = ylast_reshaped[0,:]
         Ntot_last = ylast_reshaped[1,:]
